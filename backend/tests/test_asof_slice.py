@@ -192,3 +192,110 @@ def test_slice_bad_cutoff_rejected(client):
     r2 = client.post("/api/asof-slices")
     assert r2.status_code == 400
     assert client.get("/api/asof-slices").json() == before
+
+
+def test_slice_proof_readonly_and_stable(client):
+    """不变性证明：按切片 id 查询，含 as-of/余额合计/明细行数/内容哈希；再次查询同合计同哈希。"""
+    s = client.post("/api/asof-slices", params={"cutoff_at": "2027-09-01T00:00:00Z"}).json()
+    sid = s["id"]
+
+    p1 = client.get(f"/api/asof-slices/{sid}/proof")
+    assert p1.status_code == 200, p1.text
+    body = p1.json()
+    proof = body["proof"]
+    assert proof["slice_id"] == sid
+    assert proof["cutoff_at"] == "2027-09-01T00:00:00Z"
+    assert proof["hash_algo"] == "sha256"
+    assert len(proof["content_hash"]) == 64
+    assert proof["line_count"] == body["head"]["account_count"]
+    assert proof["balance_total_cents"] == body["head"]["net_cents"]
+    assert proof["verified"] is True
+
+    # 切片详情内嵌同一份证明，且与只读证明接口逐字一致
+    detail = client.get(f"/api/asof-slices/{sid}").json()
+    assert detail["proof"] == proof
+    assert sum(l["net_cents"] for l in detail["lines"]) == proof["balance_total_cents"]
+    assert len(detail["lines"]) == proof["line_count"]
+
+    # 再次查询同 id：同合计、同哈希（读取路径不写库）
+    p2 = client.get(f"/api/asof-slices/{sid}/proof").json()
+    assert p2["proof"] == proof
+
+    # 列表也带证明字段
+    row = next(x for x in client.get("/api/asof-slices").json() if x["id"] == sid)
+    assert row["proof_content_hash"] == proof["content_hash"]
+    assert row["proof_balance_total_cents"] == proof["balance_total_cents"]
+    assert row["proof_line_count"] == proof["line_count"]
+
+
+def test_slice_proof_rows_immutable(client):
+    """证明实体与切片一样不可改写/删除。"""
+    s = client.post("/api/asof-slices", params={"cutoff_at": "2027-10-01T00:00:00Z"}).json()
+    conn = _db()
+    for stmt in (
+        "UPDATE asof_slice_proofs SET balance_total_cents = 0 WHERE slice_id = ?",
+        "DELETE FROM asof_slice_proofs WHERE slice_id = ?",
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(stmt, (s["id"],))
+        conn.rollback()
+    conn.close()
+    assert client.get(f"/api/asof-slices/{s['id']}/proof").json()["proof"]["verified"] is True
+
+
+def test_slice_proof_detects_tamper_and_refuses(client):
+    """证明被钉死：即便库层被绕过改了明细，读时校验失败即拒绝返回并要求重切。"""
+    s = client.post("/api/asof-slices", params={"cutoff_at": "2027-11-01T00:00:00Z"}).json()
+    sid = s["id"]
+    before = client.get(f"/api/asof-slices/{sid}/proof").json()["proof"]
+
+    conn = _db()
+    # 绕过触发器（触发器本应拦截，这里模拟更底层篡改/迁移事故）
+    conn.execute("DROP TRIGGER trg_asof_slice_lines_no_update")
+    conn.execute(
+        "UPDATE asof_slice_lines SET net_cents = net_cents + 1 WHERE slice_id = ? AND account_id = 1",
+        (sid,),
+    )
+    conn.commit()
+    conn.close()
+
+    r_detail = client.get(f"/api/asof-slices/{sid}")
+    r_proof = client.get(f"/api/asof-slices/{sid}/proof")
+    assert r_detail.status_code == 409
+    assert r_proof.status_code == 409
+    assert "重新切片" in r_detail.text
+
+    # 原证明内容未被改写（证明自身不可变）
+    conn = _db()
+    row = conn.execute(
+        "SELECT * FROM asof_slice_proofs WHERE slice_id = ?", (sid,)
+    ).fetchone()
+    conn.close()
+    assert row["content_hash"] == before["content_hash"]
+    assert row["balance_total_cents"] == before["balance_total_cents"]
+
+
+def test_slice_generation_failure_closed_leaves_no_proof(client, monkeypatch):
+    """失败闭：证明写入失败也整体回滚，头/明细/证明都不留半套。"""
+    before = client.get("/api/asof-slices").json()
+
+    def boom(conn, slice_id, cutoff, lines):
+        raise RuntimeError("模拟证明写入失败")
+
+    monkeypatch.setattr(asof_svc, "_insert_proof", boom)
+    with pytest.raises(RuntimeError):
+        client.post("/api/asof-slices", params={"cutoff_at": "2027-12-01T00:00:00Z"})
+
+    after = client.get("/api/asof-slices").json()
+    assert [s["id"] for s in after] == [s["id"] for s in before]
+    conn = _db()
+    orphan_proof = conn.execute(
+        "SELECT COUNT(*) AS c FROM asof_slice_proofs WHERE slice_id NOT IN (SELECT id FROM asof_slices)"
+    ).fetchone()["c"]
+    orphan_lines = conn.execute(
+        "SELECT COUNT(*) AS c FROM asof_slice_lines WHERE slice_id NOT IN (SELECT id FROM asof_slices)"
+    ).fetchone()["c"]
+    conn.close()
+    assert orphan_proof == 0
+    assert orphan_lines == 0
+

@@ -11,6 +11,8 @@ const slices = ref([])
 const sliceDetail = ref(null)
 const cutoff = ref('')
 const sliceBusy = ref(false)
+const proofLoading = ref(false)
+const proofChecked = ref(null)
 
 function nowZ() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
@@ -65,10 +67,34 @@ async function genSlice() {
 
 async function viewSlice(id) {
   err.value = ''
+  proofChecked.value = null
   try {
     sliceDetail.value = await getJson('/api/asof-slices/' + id)
   } catch (e) {
+    sliceDetail.value = null
     err.value = String(e.message || e)
+  }
+}
+
+async function recheckProof(id) {
+  proofLoading.value = true
+  err.value = ''
+  try {
+    const r = await getJson('/api/asof-slices/' + id + '/proof')
+    const d = sliceDetail.value
+    proofChecked.value =
+      d && d.id === id
+        ? {
+            at: new Date().toLocaleTimeString(),
+            sameHash: d.proof && d.proof.content_hash === r.proof.content_hash,
+            sameTotal: d.proof && d.proof.balance_total_cents === r.proof.balance_total_cents,
+          }
+        : { at: new Date().toLocaleTimeString(), sameHash: true, sameTotal: true }
+  } catch (e) {
+    proofChecked.value = null
+    err.value = String(e.message || e)
+  } finally {
+    proofLoading.value = false
   }
 }
 
@@ -117,7 +143,8 @@ function yuan(cents) {
       <h2>as-of 余额切片（时点物化）</h2>
       <p class="note-strip">
         只计入 booked_at ≤ T 且首次归并时刻 ≤ T 的已归并流水（正向 − 同类冲正），逐账户物化落库。
-        切片不可改写：T 之后的归并/撤销只影响「当前余额」，不影响已生成切片；新切片用新 id。
+        切片不可改写：旧切片禁止 UPDATE/DELETE，任何变更只能以新 id 追加；每个切片钉死不变性证明
+        （as-of、余额合计、明细行数、内容哈希），读时复算校验，再次查询必须同合计同哈希。
       </p>
       <div class="row-actions">
         <input
@@ -130,7 +157,7 @@ function yuan(cents) {
       <table>
         <thead>
           <tr>
-            <th>#</th><th>截止 T</th><th>账户数</th><th>正向合计</th><th>冲正合计</th><th>净额合计</th><th>生成时间</th><th></th>
+            <th>#</th><th>截止 T</th><th>账户数</th><th>证明合计</th><th>明细行数</th><th>内容哈希</th><th>生成时间</th><th></th>
           </tr>
         </thead>
         <tbody>
@@ -138,9 +165,9 @@ function yuan(cents) {
             <td>{{ s.id }}</td>
             <td>{{ s.cutoff_at }}</td>
             <td>{{ s.account_count }}</td>
-            <td>{{ yuan(s.forward_cents) }}</td>
-            <td>{{ yuan(s.reversal_cents) }}</td>
-            <td>{{ yuan(s.net_cents) }}</td>
+            <td>{{ yuan(s.proof_balance_total_cents) }}</td>
+            <td>{{ s.proof_line_count }}</td>
+            <td class="hash">{{ (s.proof_content_hash || '').slice(0, 16) }}…</td>
             <td>{{ s.created_at }}</td>
             <td><button class="btn secondary" @click="viewSlice(s.id)">查看</button></td>
           </tr>
@@ -154,6 +181,43 @@ function yuan(cents) {
       <p class="note-strip">
         「当前余额」为读取时实时值，仅并排对比，不回写切片；差异 = 当前余额 − 切片净额。
       </p>
+
+      <div v-if="sliceDetail.proof" class="proof-strip">
+        <div class="proof-cell">
+          <span class="proof-k">as-of 时刻</span>
+          <span class="proof-v">{{ sliceDetail.proof.cutoff_at }}</span>
+        </div>
+        <div class="proof-cell">
+          <span class="proof-k">余额合计</span>
+          <span class="proof-v">{{ yuan(sliceDetail.proof.balance_total_cents) }}</span>
+        </div>
+        <div class="proof-cell">
+          <span class="proof-k">明细行数</span>
+          <span class="proof-v">{{ sliceDetail.proof.line_count }}</span>
+        </div>
+        <div class="proof-cell">
+          <span class="proof-k">内容哈希（{{ sliceDetail.proof.hash_algo }}）</span>
+          <span class="proof-v hash">{{ sliceDetail.proof.content_hash }}</span>
+        </div>
+        <div class="proof-cell">
+          <span class="proof-k">校验</span>
+          <span class="tag" :class="sliceDetail.proof.verified ? 'on' : 'bad'">
+            {{ sliceDetail.proof.verified ? '通过（未被后写改写）' : '失败' }}
+          </span>
+        </div>
+        <div class="proof-cell">
+          <button class="btn secondary" :disabled="proofLoading" @click="recheckProof(sliceDetail.id)">
+            {{ proofLoading ? '复算中…' : '复算证明' }}
+          </button>
+          <span v-if="proofChecked" class="proof-v">
+            {{ proofChecked.at }} 复算：
+            <span class="tag" :class="proofChecked.sameHash && proofChecked.sameTotal ? 'on' : 'bad'">
+              {{ proofChecked.sameHash && proofChecked.sameTotal ? '同合计同哈希' : '不一致' }}
+            </span>
+          </span>
+        </div>
+      </div>
+
       <table>
         <thead>
           <tr>
@@ -190,6 +254,42 @@ function yuan(cents) {
   border-radius: 2px;
   min-width: 320px;
   background: var(--panel);
+  color: var(--ink);
+}
+
+.hash {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.proof-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px 18px;
+  padding: 14px 16px;
+  margin: 12px 0 18px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent-2);
+  background: var(--panel);
+}
+
+.proof-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.proof-k {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.proof-v {
+  font-family: var(--mono);
+  font-size: 13px;
   color: var(--ink);
 }
 </style>

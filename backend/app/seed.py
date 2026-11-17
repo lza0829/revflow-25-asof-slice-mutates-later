@@ -80,6 +80,47 @@ CREATE TABLE IF NOT EXISTS asof_slice_lines (
   net_cents INTEGER NOT NULL,
   UNIQUE(slice_id, account_id)
 );
+-- 不变性证明实体：每个切片一行，钉死 as-of、余额合计、明细行数与内容哈希
+CREATE TABLE IF NOT EXISTS asof_slice_proofs (
+  slice_id INTEGER PRIMARY KEY REFERENCES asof_slices(id),
+  cutoff_at TEXT NOT NULL,
+  balance_total_cents INTEGER NOT NULL,
+  line_count INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  hash_algo TEXT NOT NULL DEFAULT 'sha256',
+  created_at TEXT NOT NULL
+);
+-- 不变性路径：「旧切片禁止 UPDATE/DELETE，任何变更只能 INSERT 新切片 id」
+CREATE TRIGGER IF NOT EXISTS trg_asof_slices_no_update
+BEFORE UPDATE ON asof_slices
+BEGIN
+  SELECT RAISE(ABORT, 'as-of 切片不可改写：任何变更只能以新 id 追加新切片');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_asof_slices_no_delete
+BEFORE DELETE ON asof_slices
+BEGIN
+  SELECT RAISE(ABORT, 'as-of 切片不可删除：任何变更只能以新 id 追加新切片');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_asof_slice_lines_no_update
+BEFORE UPDATE ON asof_slice_lines
+BEGIN
+  SELECT RAISE(ABORT, 'as-of 切片明细不可改写：任何变更只能以新 id 追加新切片');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_asof_slice_lines_no_delete
+BEFORE DELETE ON asof_slice_lines
+BEGIN
+  SELECT RAISE(ABORT, 'as-of 切片明细不可删除：任何变更只能以新 id 追加新切片');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_asof_slice_proofs_no_update
+BEFORE UPDATE ON asof_slice_proofs
+BEGIN
+  SELECT RAISE(ABORT, 'as-of 切片证明不可改写：任何变更只能以新 id 追加新切片');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_asof_slice_proofs_no_delete
+BEFORE DELETE ON asof_slice_proofs
+BEGIN
+  SELECT RAISE(ABORT, 'as-of 切片证明不可删除：任何变更只能以新 id 追加新切片');
+END;
 
 """
 

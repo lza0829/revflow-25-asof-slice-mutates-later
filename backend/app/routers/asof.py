@@ -20,3 +20,9 @@ def post_slice(
 @router.get("/asof-slices/{slice_id}")
 def get_slice(slice_id: int):
     return svc.get_slice(slice_id)
+
+
+@router.get("/asof-slices/{slice_id}/proof")
+def get_slice_proof(slice_id: int):
+    """只读不变性证明：as-of、余额合计、明细行数、内容哈希。"""
+    return svc.get_slice_proof(slice_id)

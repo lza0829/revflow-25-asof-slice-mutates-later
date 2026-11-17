@@ -34,11 +34,17 @@ npm run dev
 
 净额互证页可指定截止入账时刻 T 生成切片：只计入 `booked_at ≤ T` 且首次归并时刻 `settled_at ≤ T` 的已归并流水（正向 − 同类冲正），逐账户物化落库。
 
-- **落库形态**（二选一）：切片头 `asof_slices` + 不可变按账户明细快照 `asof_slice_lines`；触发器禁改禁删，新切片一律新 id。
-- **失败闭**（二选一）：切片头与全部账户明细同事务提交，任一步失败整体回滚，不留半套。
-- T 之后的归并/撤销只改写「当前余额」；查看切片时当前余额仅并排对比（差异 = 当前余额 − 切片净额），不回写切片。
+- **落库形态**（二选一）：切片头 `asof_slices` + 不可变按账户明细快照 `asof_slice_lines`。
+- **不变性路径**（二选一）：本仓选「旧切片禁止 UPDATE/DELETE，任何变更只能 INSERT 新切片 id」，由 `asof_slices` / `asof_slice_lines` 上的触发器在库层强制。T 之后的归并/撤销只改写「当前余额」，查看切片时当前余额仅并排对比（差异 = 当前余额 − 切片净额），不回写切片。
+- **失败闭**（二选一）：切片头、全部账户明细、不变性证明同事务提交，任一步失败整体回滚，不留半套、半套切片不可查。
+- **不变性证明**：每个切片落一行 `asof_slice_proofs`，钉死 as-of 时刻、余额合计、明细行数、内容哈希（sha256，覆盖 as-of + 逐账户明细 + 合计）。读取时复算并校验，任何内容被后写改动即拒绝返回并要求重新切片；证明表本身同样禁改禁删。
 
-接口：`POST /api/asof-slices?cutoff_at=<T>` 生成；`GET /api/asof-slices` 列表；`GET /api/asof-slices/{id}` 明细（含并排差异）。
+接口：
+- `POST /api/asof-slices?cutoff_at=<T>` 生成切片
+- `GET /api/asof-slices` 列表（含证明字段）
+- `GET /api/asof-slices/{id}` 明细（含证明与并排差异）
+- `GET /api/asof-slices/{id}/proof` 只读不变性证明（按切片 id 查询）
+
 
 ## 界面约定
 
